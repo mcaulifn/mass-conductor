@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/mcaulifn/mass-conductor/compare/v0.3.0...v0.3.1) (2026-08-30)
+
+
+### Bug Fixes
+
+* correct event subscription and register card as a Lovelace resource ([#12](https://github.com/mcaulifn/mass-conductor/issues/12)) ([157fb63](https://github.com/mcaulifn/mass-conductor/commit/157fb635dba3320c3dc82664a0bb9c848d2875e8))
+
 ## [0.3.0](https://github.com/mcaulifn/mass-conductor/compare/v0.2.0...v0.3.0) (2026-08-30)
 
 
