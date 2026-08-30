@@ -2,13 +2,13 @@
   "config": {
     "step": {
       "user": {
-        "title": "Music Assistant Conductor",
-        "description": "This uses your existing Music Assistant connection, so there is nothing to configure. Select **Submit** to finish."
+        "title": "Add Music Assistant Conductor",
+        "description": "Conductor adds a dashboard card for your Music Assistant speakers — pick a room, see what's playing, control it, and browse or search your music.\n\nIt works through the Music Assistant integration you already have, so there's nothing to enter here. Select **Submit**, then add a **Music Assistant Conductor** card to any dashboard."
       }
     },
     "abort": {
-      "single_instance_allowed": "Music Assistant Conductor is already set up.",
-      "music_assistant_required": "Set up the Music Assistant integration first, then add this."
+      "single_instance_allowed": "Music Assistant Conductor is already set up. Add its card to a dashboard to use it.",
+      "music_assistant_required": "Set up the Music Assistant integration first, then add Music Assistant Conductor."
     }
   }
 }
