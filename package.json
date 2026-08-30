@@ -1,6 +1,6 @@
 {
   "name": "mass-conductor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Home Assistant Lovelace card for Music Assistant: pick room / player / source, now-playing + browse/search. Path B: a bundled HA integration holds the MA connection server-side; the card talks only to HA.",
   "type": "module",
   "scripts": {
@@ -8,7 +8,12 @@
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": ["home-assistant", "lovelace", "music-assistant", "custom-card"],
+  "keywords": [
+    "home-assistant",
+    "lovelace",
+    "music-assistant",
+    "custom-card"
+  ],
   "license": "MIT",
   "dependencies": {
     "lit": "^3.2.0"
