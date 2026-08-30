@@ -1,0 +1,1004 @@
+import { LitElement, css, html, nothing, type TemplateResult } from "lit";
+import { customElement, property, state } from "lit/decorators.js";
+import { HaClient, type HassConnectionLike } from "./ha-client";
+import type {
+  MassPlayer,
+  MassProvider,
+  MassConductorConfig,
+  MassUser,
+  MediaItemLite,
+  SearchResults,
+} from "./types";
+
+// Minimal shape of the HA `hass` object we read: the same-origin WebSocket
+// connection (for the mass_conductor passthrough) plus the area registry we
+// map players to rooms with.
+interface HassLike extends HassConnectionLike {
+  areas?: Record<string, { area_id: string; name: string }>;
+  devices?: Record<string, { area_id: string | null; identifiers: [string, string][] }>;
+  entities?: Record<
+    string,
+    { entity_id: string; device_id: string | null; area_id: string | null }
+  >;
+}
+
+/**
+ * Resolve a player's room from the HA area registry. The MA integration
+ * registers each player as a device with identifiers ["music_assistant",
+ * player_id], so we map player -> device -> area (entity-level area wins).
+ */
+function roomOf(player: MassPlayer, hass?: HassLike): string {
+  const areas = hass?.areas;
+  const devices = hass?.devices;
+  if (!areas || !devices) return "Speakers";
+  let deviceId: string | undefined;
+  let areaId: string | null = null;
+  for (const [id, dev] of Object.entries(devices)) {
+    if (dev.identifiers?.some((t) => t[0] === "music_assistant" && t[1] === player.player_id)) {
+      deviceId = id;
+      areaId = dev.area_id;
+      break;
+    }
+  }
+  if (!deviceId) return "Speakers";
+  for (const ent of Object.values(hass?.entities ?? {})) {
+    if (ent.device_id === deviceId && ent.entity_id.startsWith("media_player.") && ent.area_id) {
+      areaId = ent.area_id;
+      break;
+    }
+  }
+  return areaId && areas[areaId] ? areas[areaId].name : "Speakers";
+}
+
+function playerLabel(p: MassPlayer): string {
+  return p.display_name ?? p.name ?? p.player_id;
+}
+
+function iconFor(mt?: string): string {
+  switch (mt) {
+    case "album":
+      return "💿";
+    case "artist":
+      return "🎤";
+    case "playlist":
+      return "☰";
+    case "radio":
+      return "📻";
+    default:
+      return "♪";
+  }
+}
+
+function subtitleFor(it: { artists?: { name: string }[]; media_type?: string }): string | undefined {
+  const artists = it.artists?.map((a) => a.name).filter(Boolean).join(", ");
+  return artists || it.media_type;
+}
+
+function fmtTime(sec: number): string {
+  if (!isFinite(sec) || sec < 0) return "0:00";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+@customElement("mass-conductor")
+export class MassConductor extends LitElement {
+  @property({ attribute: false }) hass?: HassLike;
+
+  @state() private config?: MassConductorConfig;
+  @state() private users: MassUser[] = [];
+  @state() private players: MassPlayer[] = [];
+  @state() private userId?: string;
+  @state() private playerId?: string;
+  @state() private error = "";
+  @state() private loading = true;
+  @state() private query = "";
+  @state() private view: "main" | "players" | "browse" = "main";
+  @state() private playerQuery = "";
+  @state() private providers: MassProvider[] = [];
+  @state() private providerId?: string; // selected source provider; undefined = all
+  @state() private results?: SearchResults;
+  @state() private searching = false;
+  @state() private browseMode: "tree" | "search" = "tree";
+  @state() private browseItems: MediaItemLite[] = [];
+  @state() private browseStack: { name: string; path?: string }[] = [];
+  @state() private browsing = false;
+  @state() private statusMsg = "";
+  @state() private tick = 0; // forces progress re-render each second
+
+  private client?: HaClient;
+  private unsub?: () => void;
+  private timer?: number;
+  private refreshHandle?: number;
+  private initialized = false;
+
+  setConfig(config: MassConductorConfig): void {
+    this.config = config;
+    this.userId = config.default_user;
+  }
+
+  getCardSize(): number {
+    return 6;
+  }
+
+  connectedCallback(): void {
+    super.connectedCallback();
+    this.timer = window.setInterval(() => (this.tick = Date.now()), 1000);
+    this.maybeInit();
+  }
+
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    this.unsub?.();
+    this.unsub = undefined;
+    this.initialized = false;
+    if (this.timer) window.clearInterval(this.timer);
+  }
+
+  protected updated(changed: Map<string, unknown>): void {
+    if (changed.has("hass")) this.maybeInit();
+  }
+
+  // The card gets `hass` after setConfig, and again on every HA state change.
+  // Create the client the first time `hass` is available, then keep its
+  // reference fresh (HA hands out a new `hass` object each update).
+  private maybeInit(): void {
+    if (!this.hass) return;
+    if (!this.client) this.client = new HaClient(this.hass);
+    else this.client.setHass(this.hass);
+    if (this.initialized) return;
+    this.initialized = true;
+    this.unsub = this.client.onEvent((ev) => this.onEvent(ev));
+    void this.loadData();
+  }
+
+  private onEvent(ev: { event: string; object_id?: string | null; data?: unknown }): void {
+    if (ev.event === "player_updated" && ev.data) {
+      const updated = ev.data as MassPlayer;
+      const idx = this.players.findIndex((p) => p.player_id === updated.player_id);
+      if (idx >= 0) {
+        const copy = [...this.players];
+        copy[idx] = updated;
+        this.players = copy;
+      }
+    } else if (
+      ev.event === "player_added" ||
+      ev.event === "player_removed" ||
+      ev.event === "queue_updated"
+    ) {
+      this.debouncedRefresh();
+    }
+  }
+
+  private debouncedRefresh(): void {
+    if (this.refreshHandle) window.clearTimeout(this.refreshHandle);
+    this.refreshHandle = window.setTimeout(() => void this.loadData(), 400);
+  }
+
+  private async loadData(): Promise<void> {
+    if (!this.client) return;
+    try {
+      const [players, providers] = await Promise.all([
+        this.client.getPlayers(),
+        this.client.getProviders(),
+      ]);
+      this.players = players;
+      this.providers = providers;
+      this.error = "";
+      // when "Everyone" is disabled, a real user must always be selected
+      if (!this.allowEveryone && !this.selectedUser && this.users.length) {
+        const preferred = this.users.find(
+          (u) => u.user_id === this.config?.default_user || u.username === this.config?.default_user,
+        );
+        this.userId = (preferred ?? this.users[0]).user_id;
+      }
+      if (!this.playerId || !this.scopedPlayers.some((p) => p.player_id === this.playerId)) {
+        this.playerId = this.pickDefaultPlayer()?.player_id;
+      }
+    } catch (err) {
+      this.error = `Could not reach Music Assistant: ${(err as Error).message}`;
+    } finally {
+      this.loading = false;
+    }
+  }
+
+  private get selectedUser(): MassUser | undefined {
+    return this.users.find((u) => u.user_id === this.userId);
+  }
+
+  // Players are independent of the user (user is a sourcing concept only):
+  // show every available, non-synced player.
+  private get scopedPlayers(): MassPlayer[] {
+    return this.players.filter((p) => p.available && !p.synced_to);
+  }
+
+  private get selectedPlayer(): MassPlayer | undefined {
+    return this.players.find((p) => p.player_id === this.playerId);
+  }
+
+  private pickDefaultPlayer(): MassPlayer | undefined {
+    const playing = this.scopedPlayers.find((p) => p.playback_state === "playing");
+    return playing ?? this.scopedPlayers[0];
+  }
+
+  private liveElapsed(p: MassPlayer): number {
+    const cm = p.current_media;
+    const base = cm?.elapsed_time ?? p.elapsed_time ?? 0;
+    const last = cm?.elapsed_time_last_updated ?? p.elapsed_time_last_updated;
+    if (p.playback_state === "playing" && last) {
+      return base + (Date.now() / 1000 - last);
+    }
+    return base;
+  }
+
+  // ---- actions ---------------------------------------------------------
+
+  private cmd(fn: (c: HaClient, id: string) => Promise<unknown>): void {
+    const id = this.playerId;
+    if (!this.client || !id) return;
+    fn(this.client, id).catch((e) => (this.error = (e as Error).message));
+  }
+
+  // the selectable sources = music provider instances (each is an account)
+  private get musicProviders(): MassProvider[] {
+    return this.providers.filter((p) => p.type === "music");
+  }
+
+  private async doSearch(): Promise<void> {
+    if (!this.client || !this.query.trim()) return;
+    this.browseMode = "search";
+    this.searching = true;
+    this.results = undefined;
+    try {
+      this.results = await this.client.search(this.query.trim(), {
+        userId: this.userId,
+        providers: this.providerId ? [this.providerId] : undefined,
+      });
+    } catch (e) {
+      this.error = (e as Error).message;
+    } finally {
+      this.searching = false;
+    }
+  }
+
+  private openBrowse(): void {
+    this.view = "browse";
+    this.browseMode = "tree";
+    if (!this.browseStack.length) void this.loadBrowse([{ name: "Browse" }]);
+  }
+
+  // Load the folder described by the last crumb of `stack` and adopt it.
+  private async loadBrowse(stack: { name: string; path?: string }[]): Promise<void> {
+    if (!this.client) return;
+    this.browseMode = "tree";
+    this.browsing = true;
+    this.browseStack = stack;
+    try {
+      const path = stack[stack.length - 1]?.path;
+      this.browseItems = await this.client.browse(path, this.playerId);
+    } catch (e) {
+      this.error = (e as Error).message;
+      this.browseItems = [];
+    } finally {
+      this.browsing = false;
+    }
+  }
+
+  private browseTap(item: MediaItemLite): void {
+    if (item.media_type === "folder") {
+      void this.loadBrowse([...this.browseStack, { name: item.name, path: item.path }]);
+    } else {
+      void this.playItem(item);
+    }
+  }
+
+  private crumbTo(index: number): void {
+    void this.loadBrowse(this.browseStack.slice(0, index + 1));
+  }
+
+  private async playItem(item: MediaItemLite): Promise<void> {
+    const id = this.playerId;
+    if (!this.client || !id || !item.uri) return;
+    try {
+      await this.client.playMedia(id, item.uri, this.userId);
+      this.statusMsg = `▶ ${item.name}`;
+      this.view = "main";
+    } catch (e) {
+      this.error = (e as Error).message;
+    }
+  }
+
+  // ---- render ----------------------------------------------------------
+
+  render(): TemplateResult {
+    if (!this.config) return html`<ha-card>Not configured</ha-card>`;
+    if (this.loading) return html`<ha-card><div class="pad muted">Loading…</div></ha-card>`;
+    if (this.view === "players") return html`<ha-card>${this.renderPlayersView()}</ha-card>`;
+    if (this.view === "browse") return html`<ha-card>${this.renderBrowseView()}</ha-card>`;
+    return html`
+      <ha-card>
+        <div class="pickers">${this.renderPickerButtons()}</div>
+        ${this.error ? html`<div class="error">${this.error}</div>` : nothing}
+        ${this.renderNowPlaying()} ${this.renderControls()} ${this.renderSearch()}
+      </ha-card>
+    `;
+  }
+
+  private renderViewHead(title: string): TemplateResult {
+    return html`
+      <div class="view-head">
+        <button class="ctl" title="Back" @click=${() => (this.view = "main")}>‹</button>
+        <span class="view-title">${title}</span>
+      </div>
+    `;
+  }
+
+  private get allowEveryone(): boolean {
+    return this.config?.allow_everyone !== false;
+  }
+
+  private pickProvider(id?: string): void {
+    this.providerId = id;
+    if (this.browseMode === "search") {
+      if (this.query.trim()) void this.doSearch();
+      return;
+    }
+    // jump the browse tree straight into that account's root (or the all-providers root)
+    if (id) {
+      const prov = this.providers.find((p) => p.instance_id === id);
+      void this.loadBrowse([
+        { name: "Browse" },
+        { name: prov?.name ?? "Source", path: `${id}://` },
+      ]);
+    } else {
+      void this.loadBrowse([{ name: "Browse" }]);
+    }
+  }
+
+  private renderPickerButtons(): TemplateResult {
+    // Only the player/room selector lives up top. User is a *sourcing* concept
+    // (whose library to browse), so it lives inside Browse/Search, not here.
+    const p = this.selectedPlayer;
+    return html`
+      <button class="selbtn" @click=${() => (this.view = "players")}>
+        <span class="ic">🔊</span>
+        <span class="selbtn-main">${p ? playerLabel(p) : "No player"}</span>
+        ${p ? html`<span class="selbtn-sub">${roomOf(p, this.hass)}</span>` : nothing}
+        <span class="caret">▾</span>
+      </button>
+    `;
+  }
+
+  private renderPlayersView(): TemplateResult {
+    const q = this.playerQuery.trim().toLowerCase();
+    const byRoom = new Map<string, MassPlayer[]>();
+    for (const p of this.scopedPlayers) {
+      const room = roomOf(p, this.hass);
+      if (q && !playerLabel(p).toLowerCase().includes(q) && !room.toLowerCase().includes(q)) {
+        continue;
+      }
+      (byRoom.get(room) ?? byRoom.set(room, []).get(room)!).push(p);
+    }
+    return html`
+      ${this.renderViewHead("Play on…")}
+      <input
+        class="sheet-search"
+        type="text"
+        placeholder="Filter rooms or players…"
+        .value=${this.playerQuery}
+        @input=${(e: Event) => (this.playerQuery = (e.target as HTMLInputElement).value)}
+      />
+      <div class="view-list">
+        ${[...byRoom.entries()]
+          .sort((a, b) => a[0].localeCompare(b[0]))
+          .map(
+            ([room, players]) => html`
+              <div class="sheet-group">${room}</div>
+              ${players.map((p) =>
+                this.sheetRow(
+                  p.player_id === this.playerId,
+                  p.playback_state === "playing" ? "▶" : "🔊",
+                  playerLabel(p),
+                  p.playback_state === "playing" ? "playing" : undefined,
+                  () => {
+                    this.playerId = p.player_id;
+                    this.view = "main";
+                    this.playerQuery = "";
+                  },
+                ),
+              )}
+            `,
+          )}
+        ${byRoom.size === 0 ? html`<div class="muted pad">no matches</div>` : nothing}
+      </div>
+    `;
+  }
+
+  private sheetRow(
+    active: boolean,
+    icon: string,
+    label: string,
+    sub: string | undefined,
+    onClick: () => void,
+  ): TemplateResult {
+    return html`
+      <button class="sheet-row ${active ? "active" : ""}" @click=${onClick}>
+        <span class="row-ic">${icon}</span>
+        <span class="row-txt">
+          <span class="row-lbl">${label}</span>
+          ${sub ? html`<span class="row-sub">${sub}</span>` : nothing}
+        </span>
+        ${active ? html`<span class="row-check">✓</span>` : nothing}
+      </button>
+    `;
+  }
+
+  private renderNowPlaying(): TemplateResult {
+    const p = this.selectedPlayer;
+    const cm = p?.current_media;
+    const art = cm?.image_url;
+    return html`
+      <div class="art">
+        ${art
+          ? html`<img src=${art} alt="" />`
+          : html`<div class="art-empty">♪</div>`}
+      </div>
+      <div class="meta">
+        <div class="title">${cm?.title ?? "Nothing playing"}</div>
+        <div class="artist">${cm?.artist ?? (p ? playerLabel(p) : "")}</div>
+      </div>
+      ${this.renderProgress()}
+    `;
+  }
+
+  private renderProgress(): TemplateResult {
+    void this.tick; // read so the 1s timer re-renders the live position
+    const p = this.selectedPlayer;
+    const dur = p?.current_media?.duration ?? 0;
+    const el = p ? this.liveElapsed(p) : 0;
+    return html`
+      <div class="progress">
+        <input
+          type="range"
+          min="0"
+          max=${dur || 0}
+          .value=${String(Math.floor(el))}
+          ?disabled=${!dur}
+          @change=${(e: Event) =>
+            this.cmd((c, id) => c.seek(id, Number((e.target as HTMLInputElement).value)))}
+        />
+        <div class="times"><span>${fmtTime(el)}</span><span>${fmtTime(dur)}</span></div>
+      </div>
+    `;
+  }
+
+  private renderControls(): TemplateResult {
+    const p = this.selectedPlayer;
+    const playing = p?.playback_state === "playing";
+    const vol = p?.volume_level ?? 0;
+    const muted = !!p?.volume_muted;
+    return html`
+      <div class="controls">
+        <button class="ctl" title="Previous" @click=${() => this.cmd((c, id) => c.previous(id))}>
+          ⏮
+        </button>
+        <button class="ctl big" title="Play/Pause" @click=${() => this.cmd((c, id) => c.playPause(id))}>
+          ${playing ? "⏸" : "▶"}
+        </button>
+        <button class="ctl" title="Next" @click=${() => this.cmd((c, id) => c.next(id))}>⏭</button>
+      </div>
+      <div class="volrow">
+        <button class="ctl sm" title="Mute" @click=${() => this.cmd((c, id) => c.setMute(id, !muted))}>
+          ${muted ? "🔇" : "🔊"}
+        </button>
+        <input
+          type="range"
+          min="0"
+          max="100"
+          .value=${String(vol)}
+          @change=${(e: Event) =>
+            this.cmd((c, id) => c.setVolume(id, Number((e.target as HTMLInputElement).value)))}
+        />
+        <button
+          class="ctl sm ${p?.powered ? "on" : ""}"
+          title="Power"
+          @click=${() => this.cmd((c, id) => c.setPower(id, !p?.powered))}
+        >
+          ⏻
+        </button>
+      </div>
+    `;
+  }
+
+  private renderSearch(): TemplateResult {
+    return html`
+      <button class="browse" @click=${() => this.openBrowse()}>⌕ Browse / Search</button>
+      ${this.statusMsg ? html`<div class="muted status">${this.statusMsg}</div>` : nothing}
+    `;
+  }
+
+  private renderBrowseView(): TemplateResult {
+    const p = this.selectedPlayer;
+    return html`
+      ${this.renderViewHead("Browse & Search")}
+      <div class="src-bar">
+        <div class="src-line">
+          <span class="src-cap">Source</span>
+          <div class="src-chips">
+            ${this.srcChip(!this.providerId, "All", () => this.pickProvider(undefined))}
+            ${this.musicProviders.map((pr) =>
+              this.srcChip(pr.instance_id === this.providerId, pr.name, () =>
+                this.pickProvider(pr.instance_id),
+              ),
+            )}
+          </div>
+        </div>
+      </div>
+      <div class="searchbox">
+        <input
+          type="text"
+          placeholder="Search this source…"
+          .value=${this.query}
+          @input=${(e: Event) => (this.query = (e.target as HTMLInputElement).value)}
+          @keydown=${(e: KeyboardEvent) => e.key === "Enter" && this.doSearch()}
+        />
+        <button class="ctl sm" @click=${() => this.doSearch()}>⌕</button>
+      </div>
+      ${p ? nothing : html`<div class="muted pad">Pick a player first to play.</div>`}
+      ${this.renderBrowseNav()}
+      <div class="view-list">
+        ${this.browseMode === "search"
+          ? this.searching
+            ? html`<div class="muted pad">Searching…</div>`
+            : this.renderResults()
+          : this.browsing
+            ? html`<div class="muted pad">Loading…</div>`
+            : this.renderBrowseList()}
+      </div>
+    `;
+  }
+
+  private renderBrowseNav(): TemplateResult {
+    if (this.browseMode === "search") {
+      return html`
+        <button class="crumb-back" @click=${() => (this.browseMode = "tree")}>‹ Back to Browse</button>
+      `;
+    }
+    return html`
+      <div class="crumbs">
+        ${this.browseStack.map((c, i) => {
+          const last = i === this.browseStack.length - 1;
+          return html`
+            <button class="crumb ${last ? "active" : ""}" @click=${() => this.crumbTo(i)}>
+              ${c.name}
+            </button>
+            ${last ? nothing : html`<span class="crumb-sep">›</span>`}
+          `;
+        })}
+      </div>
+    `;
+  }
+
+  private renderBrowseList(): TemplateResult {
+    if (!this.browseItems.length) return html`<div class="muted pad">Empty.</div>`;
+    return html`
+      ${this.browseItems.map((it) =>
+        this.sheetRow(
+          false,
+          it.media_type === "folder" ? "📁" : iconFor(it.media_type),
+          it.name,
+          it.media_type === "folder" ? (it.subtitle ?? undefined) : subtitleFor(it),
+          () => this.browseTap(it),
+        ),
+      )}
+    `;
+  }
+
+  private srcChip(active: boolean, label: string, onClick: () => void): TemplateResult {
+    return html`<button class="srcchip ${active ? "active" : ""}" @click=${onClick}>
+      ${label}
+    </button>`;
+  }
+
+  private renderResults(): TemplateResult {
+    const r = this.results;
+    if (!r) return html`<div class="muted pad">Search to see results.</div>`;
+    const sections: [string, MediaItemLite[] | undefined][] = [
+      ["Tracks", r.tracks],
+      ["Albums", r.albums],
+      ["Artists", r.artists],
+      ["Playlists", r.playlists],
+      ["Radio", r.radio],
+    ];
+    if (!sections.some(([, list]) => list && list.length)) {
+      return html`<div class="muted pad">No results.</div>`;
+    }
+    return html`
+      ${sections.map(([label, list]) =>
+        list && list.length
+          ? html`
+              <div class="sheet-group">${label}</div>
+              ${list.map((it) =>
+                this.sheetRow(false, iconFor(it.media_type), it.name, subtitleFor(it), () =>
+                  this.playItem(it),
+                ),
+              )}
+            `
+          : nothing,
+      )}
+    `;
+  }
+
+  static styles = css`
+    ha-card {
+      padding: 16px;
+    }
+    .pad {
+      padding: 8px 0;
+    }
+    .pickers {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    /* a button that shows the current choice and opens a bottom sheet on tap */
+    .selbtn {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 44px;
+      padding: 8px 14px;
+      border: 1px solid var(--divider-color, #ccc);
+      border-radius: 22px;
+      background: var(--secondary-background-color, #f0f0f0);
+      color: var(--primary-text-color);
+      cursor: pointer;
+      font-size: 0.95rem;
+      overflow: hidden;
+    }
+    .selbtn .ic {
+      font-size: 1rem;
+    }
+    .selbtn-main {
+      flex: 1;
+      text-align: left;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .selbtn-sub {
+      font-size: 0.7rem;
+      color: var(--secondary-text-color);
+    }
+    .caret {
+      opacity: 0.6;
+      font-size: 0.7rem;
+    }
+    /* bottom sheet (custom, fully themed — no native popup) */
+    .sheet-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 10;
+    }
+    .sheet {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 11;
+      max-height: 75vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--card-background-color, #1c1c1c);
+      color: var(--primary-text-color, #fff);
+      border-radius: 18px 18px 0 0;
+      box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.4);
+      padding: 8px 12px calc(16px + env(safe-area-inset-bottom));
+    }
+    .sheet.tall {
+      height: 80vh;
+      max-height: 80vh;
+    }
+    .sheet-grip {
+      width: 40px;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--divider-color, #666);
+      margin: 6px auto 10px;
+    }
+    .sheet-title {
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin: 0 4px 10px;
+    }
+    .sheet-search {
+      margin: 0 0 10px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--divider-color, #444);
+      background: var(--secondary-background-color, #2a2a2a);
+      color: var(--primary-text-color);
+      font-size: 0.95rem;
+    }
+    .sheet-list {
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .sheet-group {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--secondary-text-color);
+      padding: 10px 6px 4px;
+      position: sticky;
+      top: 0;
+      background: var(--card-background-color, #1c1c1c);
+    }
+    .sheet-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+      min-height: 52px;
+      padding: 10px;
+      border: none;
+      border-radius: 10px;
+      background: transparent;
+      color: inherit;
+      cursor: pointer;
+      font-size: 1rem;
+      text-align: left;
+    }
+    .sheet-row:hover {
+      background: var(--secondary-background-color, rgba(255, 255, 255, 0.06));
+    }
+    .sheet-row.active {
+      color: var(--primary-color, #03a9f4);
+    }
+    .row-ic {
+      font-size: 1.1rem;
+      width: 1.4rem;
+      text-align: center;
+    }
+    .row-txt {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+    .row-sub {
+      font-size: 0.72rem;
+      color: var(--secondary-text-color);
+    }
+    .row-check {
+      font-size: 1rem;
+    }
+    .pad {
+      padding: 10px;
+    }
+    .art {
+      width: 180px;
+      height: 180px;
+      margin: 0 auto 14px;
+      border-radius: 12px;
+      overflow: hidden;
+      background: var(--secondary-background-color, #eee);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+    }
+    .art img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .art-empty {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      place-items: center;
+      font-size: 3rem;
+      color: var(--secondary-text-color);
+    }
+    .meta {
+      text-align: center;
+      margin-bottom: 8px;
+    }
+    .title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .artist {
+      color: var(--secondary-text-color);
+      font-size: 0.9rem;
+    }
+    .progress input[type="range"] {
+      width: 100%;
+    }
+    .times {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.75rem;
+      color: var(--secondary-text-color);
+    }
+    .controls {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 18px;
+      margin: 10px 0;
+    }
+    .ctl {
+      border: none;
+      background: transparent;
+      color: var(--primary-text-color);
+      font-size: 1.5rem;
+      cursor: pointer;
+      line-height: 1;
+    }
+    .ctl.big {
+      font-size: 2.4rem;
+    }
+    .ctl.sm {
+      font-size: 1.1rem;
+    }
+    .ctl.on {
+      color: var(--primary-color, #03a9f4);
+    }
+    .volrow {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 8px 0 4px;
+    }
+    .volrow input[type="range"] {
+      flex: 1;
+    }
+    .browse {
+      width: 100%;
+      margin-top: 12px;
+      padding: 10px;
+      border: 1px solid var(--divider-color, #ccc);
+      border-radius: 10px;
+      background: transparent;
+      color: var(--primary-text-color);
+      cursor: pointer;
+      font-size: 0.95rem;
+    }
+    /* in-card sub-screens (players / browse) — no fixed positioning, so they
+       work inside HA's transformed card containers and scroll normally */
+    .view-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .view-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .view-list {
+      max-height: 60vh;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    /* breadcrumbs for the browse tree */
+    .crumbs {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 2px;
+      margin: 4px 0 8px;
+    }
+    .crumb {
+      border: none;
+      background: transparent;
+      color: var(--primary-color, #03a9f4);
+      cursor: pointer;
+      font-size: 0.85rem;
+      padding: 2px 4px;
+    }
+    .crumb.active {
+      color: var(--primary-text-color);
+      font-weight: 600;
+      cursor: default;
+    }
+    .crumb-sep {
+      color: var(--secondary-text-color);
+      font-size: 0.8rem;
+    }
+    .crumb-back {
+      border: none;
+      background: transparent;
+      color: var(--primary-color, #03a9f4);
+      cursor: pointer;
+      font-size: 0.9rem;
+      padding: 4px 0;
+      margin-bottom: 4px;
+    }
+    /* source (user + provider) selectors inside the browse screen */
+    .src-bar {
+      margin-bottom: 10px;
+    }
+    .src-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .src-cap {
+      flex: 0 0 68px;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      color: var(--secondary-text-color);
+    }
+    .src-chips {
+      display: flex;
+      gap: 6px;
+      overflow-x: auto;
+      scrollbar-width: none;
+      padding-bottom: 2px;
+    }
+    .src-chips::-webkit-scrollbar {
+      display: none;
+    }
+    .srcchip {
+      flex: 0 0 auto;
+      min-height: 34px;
+      padding: 5px 12px;
+      border: 1px solid var(--divider-color, #ccc);
+      border-radius: 17px;
+      background: var(--secondary-background-color, #f0f0f0);
+      color: var(--primary-text-color);
+      cursor: pointer;
+      font-size: 0.85rem;
+      white-space: nowrap;
+    }
+    .srcchip.active {
+      background: var(--primary-color, #03a9f4);
+      color: var(--text-primary-color, #fff);
+      border-color: var(--primary-color, #03a9f4);
+    }
+    .searchbox {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .searchbox input {
+      flex: 1;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid var(--divider-color, #ccc);
+      background: var(--card-background-color, #fff);
+      color: var(--primary-text-color);
+    }
+    .status {
+      margin-top: 6px;
+    }
+    .error {
+      color: var(--error-color, #db4437);
+      margin-bottom: 8px;
+      font-size: 0.85rem;
+    }
+    .muted {
+      color: var(--secondary-text-color);
+      font-size: 0.85rem;
+    }
+  `;
+}
+
+(window as unknown as { customCards?: unknown[] }).customCards ??= [];
+(window as unknown as { customCards: unknown[] }).customCards.push({
+  type: "mass-conductor",
+  name: "Music Assistant Conductor",
+  description: "Mini Music Assistant player with room + user selection.",
+});
+
+declare global {
+  interface HTMLElementTagNameMap {
+    "mass-conductor": MassConductor;
+  }
+}

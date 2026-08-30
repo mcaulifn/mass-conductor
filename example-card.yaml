@@ -1,0 +1,20 @@
+# Prerequisite: install the "Music Assistant Conductor" integration and add it
+# via Settings -> Devices & Services. It reuses your existing Music Assistant
+# connection, so there is no url/token to enter.
+#
+# ── To add ONE card ────────────────────────────────────────────────────────
+# Edit dashboard -> + Add Card -> (bottom) Manual -> paste ONLY this object:
+#
+#   type: custom:mass-conductor
+#   title: Whole-House Audio
+#   default_user: brendan   # optional: play/search as this MA user
+#
+# ── In the RAW configuration editor ────────────────────────────────────────
+# That editor expects a whole dashboard (a top-level `views:` array):
+
+views:
+  - title: Music
+    cards:
+      - type: custom:mass-conductor
+        title: Whole-House Audio
+        # default_user: brendan
