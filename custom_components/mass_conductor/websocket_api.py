@@ -104,11 +104,15 @@ def ws_subscribe_events(
         # already understands, with `data` serialized to plain JSON.
         connection.send_message(websocket_api.event_message(msg["id"], event.to_dict()))
 
+    # subscribe(callback, event_filter, id_filter): event_filter takes a single
+    # EventType or a tuple of them — not varargs.
     connection.subscriptions[msg["id"]] = mass.subscribe(
         _forward,
-        EventType.PLAYER_UPDATED,
-        EventType.PLAYER_ADDED,
-        EventType.PLAYER_REMOVED,
-        EventType.QUEUE_UPDATED,
+        (
+            EventType.PLAYER_UPDATED,
+            EventType.PLAYER_ADDED,
+            EventType.PLAYER_REMOVED,
+            EventType.QUEUE_UPDATED,
+        ),
     )
     connection.send_result(msg["id"])
