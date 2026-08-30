@@ -43,17 +43,20 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     """Serve the bundled card JS and register it as a frontend module."""
     from homeassistant.components.frontend import add_extra_js_url
     from homeassistant.components.http import StaticPathConfig
+    from homeassistant.loader import async_get_integration
 
     js_path = Path(__file__).parent / "frontend" / FRONTEND_FILENAME
-    if not js_path.is_file():
+    if not await hass.async_add_executor_job(js_path.is_file):
         LOGGER.warning(
             "Bundled card %s not found; add the Lovelace resource manually", js_path
         )
         return
 
+    # Serve the module cacheable; the version query below busts it when needed.
     await hass.http.async_register_static_paths(
-        [StaticPathConfig(FRONTEND_URL_PATH, str(js_path), cache_headers=False)]
+        [StaticPathConfig(FRONTEND_URL_PATH, str(js_path))]
     )
-    # Cache-bust on file mtime so a rebuilt card is picked up after a restart.
-    version = int(js_path.stat().st_mtime)
-    add_extra_js_url(hass, f"{FRONTEND_URL_PATH}?v={version}")
+    # Cache-bust on the integration version (stable across restarts) so clients
+    # refresh exactly once per release, not on every restart/file re-extract.
+    integration = await async_get_integration(hass, DOMAIN)
+    add_extra_js_url(hass, f"{FRONTEND_URL_PATH}?v={integration.version}")
