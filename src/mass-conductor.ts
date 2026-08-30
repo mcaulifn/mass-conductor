@@ -1,6 +1,14 @@
 import { LitElement, css, html, nothing, type TemplateResult } from "lit";
 import { customElement, property, state } from "lit/decorators.js";
 import { HaClient, type HassConnectionLike } from "./ha-client";
+import {
+  type AreaRegistryHass,
+  fmtTime,
+  iconFor,
+  playerLabel,
+  roomOf,
+  subtitleFor,
+} from "./util";
 import type {
   MassPlayer,
   MassProvider,
@@ -10,76 +18,9 @@ import type {
   SearchResults,
 } from "./types";
 
-// Minimal shape of the HA `hass` object we read: the same-origin WebSocket
-// connection (for the mass_conductor passthrough) plus the area registry we
-// map players to rooms with.
-interface HassLike extends HassConnectionLike {
-  areas?: Record<string, { area_id: string; name: string }>;
-  devices?: Record<string, { area_id: string | null; identifiers: [string, string][] }>;
-  entities?: Record<
-    string,
-    { entity_id: string; device_id: string | null; area_id: string | null }
-  >;
-}
-
-/**
- * Resolve a player's room from the HA area registry. The MA integration
- * registers each player as a device with identifiers ["music_assistant",
- * player_id], so we map player -> device -> area (entity-level area wins).
- */
-function roomOf(player: MassPlayer, hass?: HassLike): string {
-  const areas = hass?.areas;
-  const devices = hass?.devices;
-  if (!areas || !devices) return "Speakers";
-  let deviceId: string | undefined;
-  let areaId: string | null = null;
-  for (const [id, dev] of Object.entries(devices)) {
-    if (dev.identifiers?.some((t) => t[0] === "music_assistant" && t[1] === player.player_id)) {
-      deviceId = id;
-      areaId = dev.area_id;
-      break;
-    }
-  }
-  if (!deviceId) return "Speakers";
-  for (const ent of Object.values(hass?.entities ?? {})) {
-    if (ent.device_id === deviceId && ent.entity_id.startsWith("media_player.") && ent.area_id) {
-      areaId = ent.area_id;
-      break;
-    }
-  }
-  return areaId && areas[areaId] ? areas[areaId].name : "Speakers";
-}
-
-function playerLabel(p: MassPlayer): string {
-  return p.display_name ?? p.name ?? p.player_id;
-}
-
-function iconFor(mt?: string): string {
-  switch (mt) {
-    case "album":
-      return "💿";
-    case "artist":
-      return "🎤";
-    case "playlist":
-      return "☰";
-    case "radio":
-      return "📻";
-    default:
-      return "♪";
-  }
-}
-
-function subtitleFor(it: { artists?: { name: string }[]; media_type?: string }): string | undefined {
-  const artists = it.artists?.map((a) => a.name).filter(Boolean).join(", ");
-  return artists || it.media_type;
-}
-
-function fmtTime(sec: number): string {
-  if (!isFinite(sec) || sec < 0) return "0:00";
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
+// The HA `hass` object we read: the same-origin WebSocket connection (for the
+// mass_conductor passthrough) plus the area registry (to map players to rooms).
+interface HassLike extends HassConnectionLike, AreaRegistryHass {}
 
 @customElement("mass-conductor")
 export class MassConductor extends LitElement {
