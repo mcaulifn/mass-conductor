@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/mcaulifn/mass-conductor/compare/v0.3.1...v0.4.0) (2026-08-31)
+
+
+### Features
+
+* add multi-room player grouping ([#16](https://github.com/mcaulifn/mass-conductor/issues/16)) ([4f3a354](https://github.com/mcaulifn/mass-conductor/commit/4f3a354e72825470043c1adcafef1df13e03f5f1))
+* show album-art thumbnails in browse/search rows ([#18](https://github.com/mcaulifn/mass-conductor/issues/18)) ([4979a51](https://github.com/mcaulifn/mass-conductor/commit/4979a516e47054038d5070154167d1f45cbbfa3e))
+
 ## [0.3.1](https://github.com/mcaulifn/mass-conductor/compare/v0.3.0...v0.3.1) (2026-08-30)
 
 
