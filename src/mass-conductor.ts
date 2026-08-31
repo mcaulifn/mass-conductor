@@ -8,10 +8,12 @@ import {
   groupLeaderFor,
   groupMemberIds,
   iconFor,
+  imageProxyBaseFrom,
   playerLabel,
   roomOf,
   subtitleFor,
   supportsGrouping,
+  thumbUrl,
 } from "./util";
 import type {
   MassPlayer,
@@ -159,6 +161,17 @@ export class MassConductor extends LitElement {
 
   private get selectedPlayer(): MassPlayer | undefined {
     return this.players.find((p) => p.player_id === this.playerId);
+  }
+
+  // The MA imageproxy origin, recovered from any player's now-playing image URL
+  // (the server emits those as fully-qualified imageproxy URLs). Used to build
+  // resized thumbnails for search/browse rows; undefined until a player has art.
+  private get imageProxyBase(): string | undefined {
+    for (const p of this.players) {
+      const base = imageProxyBaseFrom(p.current_media?.image_url);
+      if (base) return base;
+    }
+    return undefined;
   }
 
   private pickDefaultPlayer(): MassPlayer | undefined {
@@ -484,9 +497,35 @@ export class MassConductor extends LitElement {
     `;
   }
 
+  // Icon for a media-item row: an album-art thumbnail when the item carries a
+  // usable image, otherwise the media-type emoji. The <img> lazy-loads with
+  // fixed dimensions (no layout shift) and, on a load error, hides itself and
+  // reveals the emoji sibling so a broken image can never blank the row.
+  private rowIcon(it: MediaItemLite): string | TemplateResult {
+    const emoji = it.media_type === "folder" ? "📁" : iconFor(it.media_type);
+    const src = thumbUrl(it, this.imageProxyBase);
+    if (!src) return emoji;
+    return html`
+      <span class="row-thumb">
+        <img
+          src=${src}
+          alt=""
+          loading="lazy"
+          decoding="async"
+          @error=${(e: Event) => {
+            const img = e.target as HTMLImageElement;
+            img.style.display = "none";
+            (img.nextElementSibling as HTMLElement | null)?.style.removeProperty("display");
+          }}
+        />
+        <span class="row-thumb-fallback" style="display:none">${emoji}</span>
+      </span>
+    `;
+  }
+
   private sheetRow(
     active: boolean,
-    icon: string,
+    icon: string | TemplateResult,
     label: string,
     sub: string | undefined,
     onClick: () => void,
@@ -655,7 +694,7 @@ export class MassConductor extends LitElement {
       ${this.browseItems.map((it) =>
         this.sheetRow(
           false,
-          it.media_type === "folder" ? "📁" : iconFor(it.media_type),
+          this.rowIcon(it),
           it.name,
           it.media_type === "folder" ? (it.subtitle ?? undefined) : subtitleFor(it),
           () => this.browseTap(it),
@@ -689,7 +728,7 @@ export class MassConductor extends LitElement {
           ? html`
               <div class="sheet-group">${label}</div>
               ${list.map((it) =>
-                this.sheetRow(false, iconFor(it.media_type), it.name, subtitleFor(it), () =>
+                this.sheetRow(false, this.rowIcon(it), it.name, subtitleFor(it), () =>
                   this.playItem(it),
                 ),
               )}
@@ -831,6 +870,32 @@ export class MassConductor extends LitElement {
       font-size: 1.1rem;
       width: 1.4rem;
       text-align: center;
+      flex: 0 0 auto;
+    }
+    .row-ic:has(.row-thumb) {
+      width: 36px;
+    }
+    .row-thumb {
+      display: block;
+      width: 36px;
+      height: 36px;
+      border-radius: 6px;
+      overflow: hidden;
+      background: var(--secondary-background-color, rgba(255, 255, 255, 0.06));
+    }
+    .row-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .row-thumb-fallback {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
     }
     .row-txt {
       flex: 1;

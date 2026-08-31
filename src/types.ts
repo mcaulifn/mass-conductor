@@ -54,6 +54,17 @@ export interface MassProvider {
   type: string; // "music" | "player" | "metadata" | "plugin"
 }
 
+// Artwork reference as serialized by MA (music_assistant_models MediaItemImage).
+// `path` is either a full URL (when remotely_accessible) or a provider-relative
+// path; `proxy_id` is the opaque id for the MA imageproxy endpoint.
+export interface MediaItemImage {
+  type?: string; // ImageType, e.g. "thumb"
+  path: string;
+  provider?: string;
+  remotely_accessible?: boolean;
+  proxy_id?: string | null;
+}
+
 export interface MediaItemLite {
   uri?: string;
   name: string;
@@ -65,6 +76,10 @@ export interface MediaItemLite {
   is_playable?: boolean;
   provider?: string;
   subtitle?: string | null;
+  // artwork: full media items carry metadata.images; ItemMapping-shaped
+  // references carry a single `image`. Either may be absent.
+  image?: MediaItemImage | null;
+  metadata?: { images?: MediaItemImage[] | null } | null;
 }
 
 export interface SearchResults {
