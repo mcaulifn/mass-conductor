@@ -156,6 +156,43 @@ export class HaClient {
     });
   }
 
+  // ---- multi-room grouping --------------------------------------------
+  // Maps to the MA players controller (music_assistant/controllers/players):
+  //   players/cmd/set_members(target_player, player_ids_to_add, player_ids_to_remove)
+  //   players/cmd/ungroup(player_id)
+  // All live under the safelisted "players/" prefix.
+
+  /**
+   * Add and/or remove members of the group led by `targetPlayerId`.
+   *
+   * :param targetPlayerId: The sync-leader / group player to manage.
+   * :param opts.add: player_ids to join to the group.
+   * :param opts.remove: player_ids to remove from the group.
+   */
+  setGroupMembers(
+    targetPlayerId: string,
+    opts: { add?: string[]; remove?: string[] } = {},
+  ): Promise<void> {
+    return this.command("players/cmd/set_members", {
+      target_player: targetPlayerId,
+      ...(opts.add?.length ? { player_ids_to_add: opts.add } : {}),
+      ...(opts.remove?.length ? { player_ids_to_remove: opts.remove } : {}),
+    });
+  }
+
+  /** Join a single player to a target sync-leader / group player. */
+  groupPlayer(playerId: string, targetPlayerId: string): Promise<void> {
+    return this.command("players/cmd/group", {
+      player_id: playerId,
+      target_player: targetPlayerId,
+    });
+  }
+
+  /** Remove a player from any (sync)group it currently belongs to. */
+  ungroupPlayer(playerId: string): Promise<void> {
+    return this.command("players/cmd/ungroup", { player_id: playerId });
+  }
+
   /** Play media on a player's queue, optionally as another user (impersonation). */
   playMedia(
     playerId: string,
