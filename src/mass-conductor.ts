@@ -3,11 +3,15 @@ import { customElement, property, state } from "lit/decorators.js";
 import { HaClient, type HassConnectionLike } from "./ha-client";
 import {
   type AreaRegistryHass,
+  canGroupWith,
   fmtTime,
+  groupLeaderFor,
+  groupMemberIds,
   iconFor,
   playerLabel,
   roomOf,
   subtitleFor,
+  supportsGrouping,
 } from "./util";
 import type {
   MassPlayer,
@@ -34,7 +38,7 @@ export class MassConductor extends LitElement {
   @state() private error = "";
   @state() private loading = true;
   @state() private query = "";
-  @state() private view: "main" | "players" | "browse" = "main";
+  @state() private view: "main" | "players" | "browse" | "group" = "main";
   @state() private playerQuery = "";
   @state() private providers: MassProvider[] = [];
   @state() private providerId?: string; // selected source provider; undefined = all
@@ -180,6 +184,63 @@ export class MassConductor extends LitElement {
     fn(this.client, id).catch((e) => (this.error = (e as Error).message));
   }
 
+  // ---- grouping --------------------------------------------------------
+
+  // The effective group leader for grouping actions: if the selected player is
+  // itself synced to another, that leader is targeted so we manage the real group.
+  private get groupLeader(): MassPlayer | undefined {
+    return groupLeaderFor(this.selectedPlayer, this.players);
+  }
+
+  // Players currently in the selected player's group (excluding the leader).
+  private get groupMembers(): MassPlayer[] {
+    const ids = new Set(groupMemberIds(this.groupLeader, this.players));
+    return this.players.filter((p) => ids.has(p.player_id));
+  }
+
+  // Available, compatible players that are not already in the group.
+  private get groupCandidates(): MassPlayer[] {
+    const leader = this.groupLeader;
+    if (!leader) return [];
+    const memberIds = new Set(groupMemberIds(leader, this.players));
+    return this.players.filter(
+      (p) => p.player_id !== leader.player_id && !memberIds.has(p.player_id) && canGroupWith(leader, p),
+    );
+  }
+
+  private get canManageGroup(): boolean {
+    return supportsGrouping(this.groupLeader);
+  }
+
+  // Run a grouping command against the client, surfacing any error to the user.
+  // State refreshes live via player_updated events; we don't optimistically mutate.
+  private runGroupCmd(fn: (c: HaClient) => Promise<unknown>): void {
+    if (!this.client) return;
+    try {
+      fn(this.client).catch((e) => (this.error = (e as Error).message));
+    } catch (e) {
+      this.error = (e as Error).message;
+    }
+  }
+
+  private addToGroup(playerId: string): void {
+    const leader = this.groupLeader;
+    if (!leader) return;
+    this.runGroupCmd((c) => c.setGroupMembers(leader.player_id, { add: [playerId] }));
+  }
+
+  private removeFromGroup(playerId: string): void {
+    const leader = this.groupLeader;
+    if (!leader) return;
+    this.runGroupCmd((c) => c.setGroupMembers(leader.player_id, { remove: [playerId] }));
+  }
+
+  private ungroupAll(): void {
+    const leader = this.groupLeader;
+    if (!leader) return;
+    this.runGroupCmd((c) => c.ungroupPlayer(leader.player_id));
+  }
+
   // the selectable sources = music provider instances (each is an account)
   private get musicProviders(): MassProvider[] {
     return this.providers.filter((p) => p.type === "music");
@@ -256,6 +317,7 @@ export class MassConductor extends LitElement {
     if (this.loading) return html`<ha-card><div class="pad muted">Loading…</div></ha-card>`;
     if (this.view === "players") return html`<ha-card>${this.renderPlayersView()}</ha-card>`;
     if (this.view === "browse") return html`<ha-card>${this.renderBrowseView()}</ha-card>`;
+    if (this.view === "group") return html`<ha-card>${this.renderGroupView()}</ha-card>`;
     return html`
       <ha-card>
         <div class="pickers">${this.renderPickerButtons()}</div>
@@ -300,12 +362,79 @@ export class MassConductor extends LitElement {
     // Only the player/room selector lives up top. User is a *sourcing* concept
     // (whose library to browse), so it lives inside Browse/Search, not here.
     const p = this.selectedPlayer;
+    const memberCount = p ? this.groupMembers.length : 0;
     return html`
       <button class="selbtn" @click=${() => (this.view = "players")}>
         <span class="ic">🔊</span>
         <span class="selbtn-main">${p ? playerLabel(p) : "No player"}</span>
         ${p ? html`<span class="selbtn-sub">${roomOf(p, this.hass)}</span>` : nothing}
         <span class="caret">▾</span>
+      </button>
+      ${p && this.canManageGroup
+        ? html`
+            <button
+              class="groupbtn ${memberCount ? "on" : ""}"
+              title="Group speakers"
+              @click=${() => (this.view = "group")}
+            >
+              <span class="ic">🔗</span>
+              ${memberCount ? html`<span class="group-badge">+${memberCount}</span>` : nothing}
+            </button>
+          `
+        : nothing}
+    `;
+  }
+
+  private renderGroupView(): TemplateResult {
+    const leader = this.groupLeader;
+    if (!leader) {
+      return html`
+        ${this.renderViewHead("Group speakers")}
+        <div class="muted pad">Pick a player first.</div>
+      `;
+    }
+    if (!this.canManageGroup) {
+      return html`
+        ${this.renderViewHead("Group speakers")}
+        <div class="muted pad">${playerLabel(leader)} doesn't support grouping.</div>
+      `;
+    }
+    const members = this.groupMembers;
+    const candidates = this.groupCandidates;
+    return html`
+      ${this.renderViewHead("Group speakers")}
+      ${this.error ? html`<div class="error">${this.error}</div>` : nothing}
+      <div class="view-list">
+        <div class="sheet-group">Playing on</div>
+        ${this.sheetRow(true, "🔊", playerLabel(leader), roomOf(leader, this.hass), () => {})}
+        ${members.length
+          ? html`
+              <div class="sheet-group">Grouped speakers</div>
+              ${members.map((m) =>
+                this.groupRow(m, "remove", () => this.removeFromGroup(m.player_id)),
+              )}
+              <button class="browse ungroup" @click=${() => this.ungroupAll()}>
+                ✕ Ungroup all
+              </button>
+            `
+          : html`<div class="muted pad">No other speakers grouped yet.</div>`}
+        <div class="sheet-group">Add speakers</div>
+        ${candidates.length
+          ? candidates.map((c) => this.groupRow(c, "add", () => this.addToGroup(c.player_id)))
+          : html`<div class="muted pad">No compatible speakers available.</div>`}
+      </div>
+    `;
+  }
+
+  private groupRow(p: MassPlayer, action: "add" | "remove", onClick: () => void): TemplateResult {
+    return html`
+      <button class="sheet-row group-row" @click=${onClick}>
+        <span class="row-ic">🔊</span>
+        <span class="row-txt">
+          <span class="row-lbl">${playerLabel(p)}</span>
+          <span class="row-sub">${roomOf(p, this.hass)}</span>
+        </span>
+        <span class="group-act ${action}">${action === "add" ? "＋" : "✕"}</span>
       </button>
     `;
   }
@@ -915,6 +1044,44 @@ export class MassConductor extends LitElement {
       border: 1px solid var(--divider-color, #ccc);
       background: var(--card-background-color, #fff);
       color: var(--primary-text-color);
+    }
+    /* group speakers button next to the player selector */
+    .groupbtn {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      min-height: 44px;
+      padding: 8px 12px;
+      border: 1px solid var(--divider-color, #ccc);
+      border-radius: 22px;
+      background: var(--secondary-background-color, #f0f0f0);
+      color: var(--primary-text-color);
+      cursor: pointer;
+      font-size: 0.95rem;
+    }
+    .groupbtn.on {
+      background: var(--primary-color, #03a9f4);
+      color: var(--text-primary-color, #fff);
+      border-color: var(--primary-color, #03a9f4);
+    }
+    .group-badge {
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .group-row .group-act {
+      font-size: 1.2rem;
+      width: 1.6rem;
+      text-align: center;
+    }
+    .group-act.add {
+      color: var(--primary-color, #03a9f4);
+    }
+    .group-act.remove {
+      color: var(--error-color, #db4437);
+    }
+    .ungroup {
+      margin-top: 8px;
+      color: var(--error-color, #db4437);
     }
     .status {
       margin-top: 6px;
