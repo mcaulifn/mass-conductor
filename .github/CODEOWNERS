@@ -1,0 +1,6 @@
+# CODEOWNERS for mass-conductor
+# Owners are requested for review automatically on any PR touching matched paths.
+# See https://docs.github.com/articles/about-code-owners
+
+# Default owner for everything in the repo
+* @mcaulifn
