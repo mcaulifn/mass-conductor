@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/mcaulifn/mass-conductor/compare/v0.4.0...v0.4.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* align transport controls and add a per-card default player ([#22](https://github.com/mcaulifn/mass-conductor/issues/22)) ([aa4ea19](https://github.com/mcaulifn/mass-conductor/commit/aa4ea19cf24f92907140e225fe0817eac57ce622))
+
 ## [0.4.0](https://github.com/mcaulifn/mass-conductor/compare/v0.3.1...v0.4.0) (2026-08-31)
 
 
