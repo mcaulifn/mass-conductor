@@ -28,6 +28,26 @@ import type {
 // mass_conductor passthrough) plus the area registry (to map players to rooms).
 interface HassLike extends HassConnectionLike, AreaRegistryHass {}
 
+// Transport glyphs as SVG paths. Emoji (⏮ ⏸ ▶ …) render at wildly different
+// baselines and widths across platforms, which is what threw the pause button
+// out of line with its neighbours; a fixed-size viewBox keeps them aligned.
+const ICONS = {
+  previous: "M6 6h2.5v12H6zm3.5 6 8.5 6V6z",
+  next: "M15.5 6H18v12h-2.5zM14.5 12 6 18V6z",
+  play: "M8 5v14l11-7z",
+  pause: "M6.5 5h3.5v14H6.5zm7.5 0h3.5v14H14z",
+  volume:
+    "M3 9v6h4l5 5V4L7 9zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05A4.47 4.47 0 0 0 16.5 12M14 3.23v2.06a6.99 6.99 0 0 1 0 13.42v2.06a9 9 0 0 0 0-17.54",
+  muted:
+    "M16.5 12A4.5 4.5 0 0 0 14 7.97v2.21l2.45 2.45q.05-.3.05-.63M19 12c0 .94-.2 1.82-.54 2.64l1.51 1.51A8.8 8.8 0 0 0 21 12a9 9 0 0 0-7-8.77v2.06A6.99 6.99 0 0 1 19 12M4.27 3 3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06a8.9 8.9 0 0 0 3.69-1.81L19.73 21 21 19.73zM12 4 9.91 6.09 12 8.18z",
+  power:
+    "M13 3h-2v10h2zm4.83 2.17-1.42 1.42A6.92 6.92 0 0 1 19 12a7 7 0 1 1-14 0c0-2.05.88-3.9 2.28-5.19L5.86 5.39A8.96 8.96 0 0 0 3 12a9 9 0 0 0 18 0c0-2.74-1.23-5.18-3.17-6.83",
+} as const;
+
+function icon(name: keyof typeof ICONS): TemplateResult {
+  return html`<svg viewBox="0 0 24 24" aria-hidden="true"><path d=${ICONS[name]}></path></svg>`;
+}
+
 @customElement("mass-conductor")
 export class MassConductor extends LitElement {
   @property({ attribute: false }) hass?: HassLike;
@@ -58,10 +78,16 @@ export class MassConductor extends LitElement {
   private timer?: number;
   private refreshHandle?: number;
   private initialized = false;
+  // Set once the user taps a player, so refreshes never move them elsewhere.
+  private playerPicked = false;
 
   setConfig(config: MassConductorConfig): void {
+    const defaultChanged = config.default_player !== this.config?.default_player;
     this.config = config;
     this.userId = config.default_user;
+    // A new default_player in the config wins over an earlier auto-pick, but
+    // never over a player the user chose in this session.
+    if (defaultChanged && !this.playerPicked) this.playerId = undefined;
   }
 
   getCardSize(): number {
@@ -139,7 +165,11 @@ export class MassConductor extends LitElement {
         );
         this.userId = (preferred ?? this.users[0]).user_id;
       }
-      if (!this.playerId || !this.scopedPlayers.some((p) => p.player_id === this.playerId)) {
+      // Only fall back to a default when there is no selection at all, or the
+      // selected player has genuinely disappeared. A player that momentarily
+      // reports unavailable (common right after a pause) must not move the
+      // card off the speaker the user is looking at.
+      if (!this.playerId || !this.players.some((p) => p.player_id === this.playerId)) {
         this.playerId = this.pickDefaultPlayer()?.player_id;
       }
     } catch (err) {
@@ -156,7 +186,9 @@ export class MassConductor extends LitElement {
   // Players are independent of the user (user is a sourcing concept only):
   // show every available, non-synced player.
   private get scopedPlayers(): MassPlayer[] {
-    return this.players.filter((p) => p.available && !p.synced_to);
+    return this.players.filter(
+      (p) => (p.available && !p.synced_to) || p.player_id === this.playerId,
+    );
   }
 
   private get selectedPlayer(): MassPlayer | undefined {
@@ -174,7 +206,19 @@ export class MassConductor extends LitElement {
     return undefined;
   }
 
+  // Preference order: the player named in the card config, then whatever is
+  // currently playing, then the first available player.
   private pickDefaultPlayer(): MassPlayer | undefined {
+    const want = this.config?.default_player?.trim().toLowerCase();
+    if (want) {
+      const configured = this.scopedPlayers.find(
+        (p) =>
+          p.player_id.toLowerCase() === want ||
+          p.name?.toLowerCase() === want ||
+          p.display_name?.toLowerCase() === want,
+      );
+      if (configured) return configured;
+    }
     const playing = this.scopedPlayers.find((p) => p.playback_state === "playing");
     return playing ?? this.scopedPlayers[0];
   }
@@ -485,6 +529,7 @@ export class MassConductor extends LitElement {
                   p.playback_state === "playing" ? "playing" : undefined,
                   () => {
                     this.playerId = p.player_id;
+                    this.playerPicked = true;
                     this.view = "main";
                     this.playerQuery = "";
                   },
@@ -589,16 +634,26 @@ export class MassConductor extends LitElement {
     return html`
       <div class="controls">
         <button class="ctl" title="Previous" @click=${() => this.cmd((c, id) => c.previous(id))}>
-          ⏮
+          ${icon("previous")}
         </button>
-        <button class="ctl big" title="Play/Pause" @click=${() => this.cmd((c, id) => c.playPause(id))}>
-          ${playing ? "⏸" : "▶"}
+        <button
+          class="ctl big"
+          title=${playing ? "Pause" : "Play"}
+          @click=${() => this.cmd((c, id) => c.playPause(id))}
+        >
+          ${icon(playing ? "pause" : "play")}
         </button>
-        <button class="ctl" title="Next" @click=${() => this.cmd((c, id) => c.next(id))}>⏭</button>
+        <button class="ctl" title="Next" @click=${() => this.cmd((c, id) => c.next(id))}>
+          ${icon("next")}
+        </button>
       </div>
       <div class="volrow">
-        <button class="ctl sm" title="Mute" @click=${() => this.cmd((c, id) => c.setMute(id, !muted))}>
-          ${muted ? "🔇" : "🔊"}
+        <button
+          class="ctl sm"
+          title=${muted ? "Unmute" : "Mute"}
+          @click=${() => this.cmd((c, id) => c.setMute(id, !muted))}
+        >
+          ${icon(muted ? "muted" : "volume")}
         </button>
         <input
           type="range"
@@ -613,7 +668,7 @@ export class MassConductor extends LitElement {
           title="Power"
           @click=${() => this.cmd((c, id) => c.setPower(id, !p?.powered))}
         >
-          ⏻
+          ${icon("power")}
         </button>
       </div>
     `;
@@ -962,10 +1017,19 @@ export class MassConductor extends LitElement {
       display: flex;
       justify-content: center;
       align-items: center;
-      gap: 18px;
+      gap: 12px;
       margin: 10px 0;
     }
+    /* square, flex-centred hit target so every control sits on one axis
+       regardless of whether its content is an SVG or a text glyph */
     .ctl {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      width: 40px;
+      height: 40px;
+      padding: 0;
       border: none;
       background: transparent;
       color: var(--primary-text-color);
@@ -973,11 +1037,29 @@ export class MassConductor extends LitElement {
       cursor: pointer;
       line-height: 1;
     }
+    .ctl svg {
+      width: 26px;
+      height: 26px;
+      display: block;
+      fill: currentColor;
+    }
     .ctl.big {
+      width: 56px;
+      height: 56px;
       font-size: 2.4rem;
     }
+    .ctl.big svg {
+      width: 40px;
+      height: 40px;
+    }
     .ctl.sm {
+      width: 32px;
+      height: 32px;
       font-size: 1.1rem;
+    }
+    .ctl.sm svg {
+      width: 20px;
+      height: 20px;
     }
     .ctl.on {
       color: var(--primary-color, #03a9f4);

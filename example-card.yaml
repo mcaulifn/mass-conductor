@@ -7,7 +7,8 @@
 #
 #   type: custom:mass-conductor
 #   title: Whole-House Audio
-#   default_user: brendan   # optional: play/search as this MA user
+#   default_user: brendan       # optional: play/search as this MA user
+#   default_player: Kitchen     # optional: player this card opens on
 #
 # ── In the RAW configuration editor ────────────────────────────────────────
 # That editor expects a whole dashboard (a top-level `views:` array):
@@ -18,3 +19,4 @@ views:
       - type: custom:mass-conductor
         title: Whole-House Audio
         # default_user: brendan
+        # default_player: Kitchen   # player id or name this card opens on

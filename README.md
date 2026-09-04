@@ -35,10 +35,16 @@ If the card type isn't found, hard-refresh your browser once.
 
 ## Options
 
-| Option         | Required | Description                                             |
-| -------------- | -------- | ------------------------------------------------------- |
-| `title`        | no       | Card heading.                                           |
-| `default_user` | no       | Play and search as this Music Assistant user.           |
+| Option           | Required | Description                                                                             |
+| ---------------- | -------- | --------------------------------------------------------------------------------------- |
+| `title`          | no       | Card heading.                                                                             |
+| `default_user`   | no       | Play and search as this Music Assistant user.                                             |
+| `default_player` | no       | Player this card starts on — its MA `player_id` or its name. Falls back to whatever is playing. |
+
+Each card instance can point at a different `default_player`, so a kitchen
+dashboard and a study dashboard can each open on their own speaker. Once you
+pick a player in the card, that choice sticks for the session — refreshes and
+playback changes never move the card to another speaker.
 
 ## Development
 

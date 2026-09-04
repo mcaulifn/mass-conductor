@@ -105,6 +105,9 @@ export interface MassConductorConfig {
   // If set, play/search as this MA user (user_id or username) — the
   // server-held admin connection performs the impersonation.
   default_user?: string;
+  // Player this card starts on (MA player_id, name, or display name). The
+  // selection is sticky afterwards: the card never silently switches away.
+  default_player?: string;
   // Reserved for a future in-card user picker; unused by the current UI.
   allow_everyone?: boolean;
 }
